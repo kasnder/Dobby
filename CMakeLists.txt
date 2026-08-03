@@ -126,6 +126,7 @@ set(dobby.SOURCE_FILE_LIST ${dobby.SOURCE_FILE_LIST}
   source/InstructionRelocation/x86/InstructionRelocationX86Shared.cc
   source/InstructionRelocation/x64/InstructionRelocationX64.cc
   source/InstructionRelocation/x86/x86_insn_decode/x86_insn_decode.c
+  source/InstructionRelocation/x86/x86_insn_decode/x86_relo_classify.c
 
   # intercept routing
   source/InterceptRouting/InterceptRouting.h

@@ -6,6 +6,7 @@
 
 #include "InstructionRelocation/x86/InstructionRelocationX86.h"
 #include "InstructionRelocation/x86/x86_insn_decode/x86_insn_decode.h"
+#include "InstructionRelocation/x86/x86_insn_decode/x86_relo_classify.h"
 #include "MemoryAllocator/NearMemoryAllocator.h"
 
 using namespace zz::x86;
@@ -46,12 +47,19 @@ int GenRelocateSingleX86Insn(addr_t curr_orig_ip, addr_t curr_relo_ip, uint8_t *
 
   auto last_relo_offset = code_buffer->buffer_size;
 
-  static auto x86_insn_encode_start = 0;
-  static auto x86_insn_encoded_len = 0;
+  // Not static: these are per-instruction bookkeeping, and a shared copy would be torn by a
+  // second thread installing a hook at the same time.
+  auto x86_insn_encode_start = 0;
+  auto x86_insn_encoded_len = 0;
   auto x86_insn_encode_begin = [&] { x86_insn_encode_start = code_buffer->buffer_size; };
   auto x86_insn_encode_end = [&] { x86_insn_encoded_len = code_buffer->buffer_size - x86_insn_encode_start; };
 
-  if (insn.primary_opcode >= 0x70 && insn.primary_opcode <= 0x7F) { // jcc rel8
+  // Dispatch on the shared classifier rather than on primary_opcode directly: primary_opcode
+  // holds only the second byte of a two-byte opcode, so 0F 7E (an SSE move) and 7E (a short
+  // conditional branch) are indistinguishable here without it.
+  const x86_relo_kind_t relo_kind = x86_relo_classify(&insn);
+
+  if (relo_kind == X86_RELO_JCC_REL8) { // jcc rel8
     DEBUG_LOG("[x86 relo] %p: jc rel8", buffer_cursor);
 
     int8_t offset = insn.immediate;
@@ -78,8 +86,37 @@ int GenRelocateSingleX86Insn(addr_t curr_orig_ip, addr_t curr_relo_ip, uint8_t *
     codegen_x64_jmp_absolute_addr(code_buffer, orig_dst_ip);
 #endif
 
-  } else if (mode == 64 && (insn.flags & X86_INSN_DECODE_FLAG_IP_RELATIVE) &&
-             (insn.operands[1].mem.base == RIP)) { // RIP
+  } else if (relo_kind == X86_RELO_JCC_REL32) { // jcc rel32 (0F 80..8F)
+    DEBUG_LOG("[x86 relo] %p: jc rel32", buffer_cursor);
+
+    int32_t offset = (int32_t)insn.immediate;
+    addr_t orig_dst_ip = curr_orig_ip + offset;
+#if defined(TARGET_ARCH_IA32)
+    x86_insn_encode_begin();
+    __ Emit<int8_t>(0x0F);
+    __ Emit<int8_t>(insn.primary_opcode);
+    emit_rel32_label(code_buffer, x86_insn_encode_start, curr_relo_ip, orig_dst_ip);
+#else
+    // Same shape as the rel8 case above: branch over an absolute jump, because the original
+    // destination is generally further from the trampoline than any rel32 can reach. The short
+    // form of the same condition is 0x70 | cc, where the near form is 0x80 | cc.
+    const uint8_t short_opcode = (uint8_t)(0x70 | (insn.primary_opcode & 0x0F));
+
+    // jcc_true stage 1
+    const uint8_t label_jcc_cond_true_stage2 = 2;
+    __ Emit<int8_t>(short_opcode);
+    __ Emit<int8_t>(label_jcc_cond_true_stage2);
+
+    // jcc_false
+    const uint8_t label_cond_false = 6 + 8;
+    __ Emit<int8_t>(0xEB);
+    __ Emit<int8_t>(label_cond_false);
+
+    // jcc_true stage 2, jmp to orig dst
+    codegen_x64_jmp_absolute_addr(code_buffer, orig_dst_ip);
+#endif
+
+  } else if (mode == 64 && relo_kind == X86_RELO_RIP_RELATIVE) { // RIP
     DEBUG_LOG("[x86 relo] %p: rip", buffer_cursor);
 
     int32_t orig_disp = insn.operands[1].mem.disp;
@@ -125,7 +162,7 @@ int GenRelocateSingleX86Insn(addr_t curr_orig_ip, addr_t curr_relo_ip, uint8_t *
       DobbyCodePatch((void *)rip_insn_seq_addr, rip_insn_seq_buffer.buffer, rip_insn_seq_buffer.buffer_size);
     }
 
-  } else if (insn.primary_opcode == 0xEB) { // jmp rel8
+  } else if (relo_kind == X86_RELO_JMP_REL8) { // jmp rel8
     DEBUG_LOG("[x86 relo] %p: jmp rel8", buffer_cursor);
 
     int8_t offset = insn.immediate;
@@ -139,7 +176,7 @@ int GenRelocateSingleX86Insn(addr_t curr_orig_ip, addr_t curr_relo_ip, uint8_t *
     // jmp *(rip)
     codegen_x64_jmp_absolute_addr(code_buffer, orig_dst_ip);
 #endif
-  } else if (insn.primary_opcode == 0xE8 || insn.primary_opcode == 0xE9) { // call or jmp rel32
+  } else if (relo_kind == X86_RELO_CALL_JMP_REL32) { // call or jmp rel32
     DEBUG_LOG("[x86 relo] %p:jmp or call rel32", buffer_cursor);
 
     int32_t offset = insn.immediate;
@@ -174,11 +211,10 @@ int GenRelocateSingleX86Insn(addr_t curr_orig_ip, addr_t curr_relo_ip, uint8_t *
       __ Emit<int64_t>(orig_dst_ip);
     }
 #endif
-  } else if (insn.primary_opcode >= 0xE0 && insn.primary_opcode <= 0xE2) { // LOOPNZ/LOOPZ/LOOP/JECXZ
-    // LOOP/LOOPcc
-    UNIMPLEMENTED();
-  } else if (insn.primary_opcode == 0xE3) {
-    // JCXZ JCEXZ JCRXZ
+  } else if (relo_kind == X86_RELO_UNSUPPORTED) {
+    // LOOP/LOOPcc/JrCXZ: an IP-relative field with no rewrite here. Copying it verbatim would
+    // leave the trampoline branching into the original function, so this stays a hard stop.
+    // Callers that must not abort are expected to classify the target first and decline the hook.
     UNIMPLEMENTED();
   } else {
     __ EmitBuffer(buffer_cursor, insn.length);

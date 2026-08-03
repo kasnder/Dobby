@@ -22,6 +22,10 @@ typedef enum {
   X86_INSN_DECODE_FLAG_IP_RELATIVE = 1 << 3,
 
   X86_INSN_DECODE_FLAG_OPERAND_SIZE_64 = 1 << 4,
+
+  /* Opcode was escaped with 0x0F. primary_opcode holds only the second byte, so without this
+     flag a two-byte opcode is indistinguishable from the one-byte opcode of the same value. */
+  X86_INSN_DECODE_FLAG_TWO_BYTE_OPCODE = 1 << 5,
 } x86_insn_decode_flag_t;
 
 typedef enum {

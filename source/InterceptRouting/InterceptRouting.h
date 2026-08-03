@@ -45,12 +45,19 @@ struct InterceptRouting {
   addr_t trampoline_addr() {
     if (near_trampoline)
       return near_trampoline->addr();
+    // Both allocators can fail (no free page within branch range, or no executable memory at
+    // all). Report 0 instead of dereferencing null, so the GenerateRelocatedCode() guard below
+    // can turn it into a refused hook rather than a crash inside DobbyHook.
+    if (!trampoline)
+      return 0;
     return trampoline->addr();
   }
 
   size_t trampoline_size() {
     if (near_trampoline)
       return near_trampoline->size();
+    if (!trampoline)
+      return 0;
     return trampoline->size();
   }
 

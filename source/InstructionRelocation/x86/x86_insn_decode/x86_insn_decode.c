@@ -294,7 +294,7 @@ void x86_insn_decode_modrm_sib(x86_insn_reader_t *rd, x86_insn_decode_t *insn, x
     insn->flags |= X86_INSN_DECODE_FLAG_HAS_BASE;
 
     if (mod == 0 && (rm & 7) == 5) {
-      insn->flags = X86_INSN_DECODE_FLAG_IP_RELATIVE;
+      insn->flags |= X86_INSN_DECODE_FLAG_IP_RELATIVE;
       mem_op->mem.base = RIP;
       disp_bits = 32;
     } else if (mod == 0) {
@@ -441,12 +441,19 @@ static void x86_insn_decode_opcode(x86_insn_reader_t *rd, x86_insn_decode_t *ins
   if (opcode == 0x0f) {
     opcode = read_byte(rd);
     insn_spec = x86_opcode_map_two_byte[opcode];
+    // primary_opcode keeps only the second byte, so record the escape. Two-byte opcodes overlap
+    // the one-byte space (0F 7E is an SSE move, 7E is a short conditional branch) and a consumer
+    // that dispatches on primary_opcode alone cannot tell them apart.
+    insn->flags |= X86_INSN_DECODE_FLAG_TWO_BYTE_OPCODE;
   } else {
     insn_spec = x86_opcode_map_one_byte[opcode];
   }
 
   // check sse group
   if (X86_INSN_FLAG_GET_GROUP(insn_spec.flags) > X86_INSN_SSE_GROUP_START) {
+    // An SSE opcode in the bytes being relocated used to abort the process. The base table entry
+    // already carries this instruction's operands, so keeping it decodes the length correctly;
+    // only the group refinement (which selects between prefix variants) is skipped.
     insn->primary_opcode = opcode;
     insn->insn_spec = insn_spec;
     return;
@@ -469,6 +476,17 @@ static void x86_insn_decode_opcode(x86_insn_reader_t *rd, x86_insn_decode_t *ins
     // update the insn spec
     insn_spec.name = group_insn->name;
     insn_spec.flags = group_insn->flags;
+    // Operands are declared on whichever of the two entries knows them: group 1 leaves them on the
+    // base entry (0x83 is `op2f(modrm_group_1, ..., Ev, Ib)` over `op0(cmp)`), while group 5
+    // leaves them on the group entry (`op1(jmp, Ev)` over `op0f(modrm_group_5, ...)`). Taking the
+    // group's unconditionally erased the first kind; ignoring it left the second kind with no
+    // operands to decode, which reported those instructions as one byte long and desynchronised
+    // every instruction relocated after them. '_' is the table's placeholder for "not declared".
+    if (group_insn->operands[0].code != '_') {
+      for (int i = 0; i < 3; i++) {
+        insn_spec.operands[i] = group_insn->operands[i];
+      }
+    }
   }
 
   insn->primary_opcode = opcode;
