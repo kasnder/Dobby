@@ -59,9 +59,16 @@ static uint32_t read_dword(x86_insn_reader_t *rd) {
 static uint64_t read_qword(x86_insn_reader_t *rd) {
   DEBUG_LOG("[x86 insn reader] %p - 8", rd->buffer_cursor);
 
-  uint64_t *p = (uint64_t *)rd->buffer_cursor;
-  rd->buffer_cursor += 4;
-  return p[0];
+  // Advanced by 4, so every 64-bit immediate left the cursor four bytes short and the instruction
+  // was reported four bytes shorter than it is -- `movabs $imm64,%reg` decoded as six bytes. Read
+  // bytewise as well: the old cast dereferenced a possibly-unaligned uint64_t.
+  const unsigned char *p = rd->buffer_cursor;
+  rd->buffer_cursor += 8;
+  uint64_t value = 0;
+  for (int i = 0; i < 8; i++) {
+    value |= (uint64_t)p[i] << (i * 8);
+  }
+  return value;
 }
 
 static uint32_t read_imm(x86_insn_reader_t *rd, int size) {

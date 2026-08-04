@@ -4,6 +4,12 @@
 #include "x86_relo_classify.h"
 
 x86_relo_kind_t x86_relo_classify(const x86_insn_decode_t *insn) {
+  /* If the decoder could not model the encoding its length is a guess, and relocating on a
+     guessed length desynchronises everything after it. Refuse before looking at anything else. */
+  if (insn->flags & X86_INSN_DECODE_FLAG_UNDECODABLE) {
+    return X86_RELO_UNSUPPORTED;
+  }
+
   const int two_byte = (insn->flags & X86_INSN_DECODE_FLAG_TWO_BYTE_OPCODE) != 0;
 
   /* A RIP-relative memory operand is independent of the opcode's length, so it is settled first.

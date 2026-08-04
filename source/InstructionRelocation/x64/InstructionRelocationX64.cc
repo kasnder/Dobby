@@ -32,8 +32,12 @@ int GenRelocateCodeFixed(void *buffer, CodeMemBlock *origin, CodeMemBlock *reloc
   while ((buffer_cursor < ((uint8_t *)buffer + predefined_relocate_size))) {
     x86_insn_decode_t insn = {0};
     memset(&insn, 0, sizeof(insn));
-    GenRelocateSingleX86Insn(curr_orig_ip, curr_relo_ip, buffer_cursor, &turbo_assembler_,
-                             turbo_assembler_.code_buffer(), insn, 64);
+    if (GenRelocateSingleX86Insn(curr_orig_ip, curr_relo_ip, buffer_cursor, &turbo_assembler_,
+                                 turbo_assembler_.code_buffer(), insn, 64) != 0) {
+      // Relocation refused. Reported as a distinct code so the retry-with-a-bigger-buffer loop
+      // does not spin on a failure that more space cannot fix.
+      return -2;
+    }
 
     // go next
     curr_orig_ip += insn.length;

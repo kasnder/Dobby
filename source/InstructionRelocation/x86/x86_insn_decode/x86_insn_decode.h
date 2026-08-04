@@ -26,6 +26,10 @@ typedef enum {
   /* Opcode was escaped with 0x0F. primary_opcode holds only the second byte, so without this
      flag a two-byte opcode is indistinguishable from the one-byte opcode of the same value. */
   X86_INSN_DECODE_FLAG_TWO_BYTE_OPCODE = 1 << 5,
+
+  /* The decoder does not model this encoding, so `length` is not trustworthy. Consumers that
+     relocate code must refuse the instruction rather than act on a guessed length. */
+  X86_INSN_DECODE_FLAG_UNDECODABLE = 1 << 6,
 } x86_insn_decode_flag_t;
 
 typedef enum {

@@ -130,6 +130,13 @@ int GenRelocateSingleX86Insn(addr_t curr_orig_ip, addr_t curr_relo_ip, uint8_t *
       auto rip_insn_seq = (addr_t)blk.addr();
       rip_insn_seq_addr = rip_insn_seq;
     }
+    // The allocator can come back empty when no free page exists within branch range. Emitting the
+    // jump anyway sends the trampoline into an address that was never written, and execution runs
+    // off into zeroed memory -- a null dereference inside an anonymous mapping, far from here.
+    if (rip_insn_seq_addr == 0) {
+      ERROR_LOG("[x86 relo] no near code block for rip-relative insn at %p", buffer_cursor);
+      return -1;
+    }
 
     // jmp *(rip) => jmp to [rip insn seq]
     x86_insn_encode_begin();
@@ -145,7 +152,14 @@ int GenRelocateSingleX86Insn(addr_t curr_orig_ip, addr_t curr_relo_ip, uint8_t *
 
       auto rip_insn_req_ip = rip_insn_seq_addr;
       rip_insn_req_ip = rip_insn_req_ip + insn.length; // next insn addr
-      int32_t new_disp = (int32_t)(orig_dst_ip - rip_insn_req_ip);
+      int64_t new_disp64 = (int64_t)orig_dst_ip - (int64_t)rip_insn_req_ip;
+      // A RIP-relative displacement is 32-bit. If the block the allocator returned is further away
+      // than that reaches, truncating silently points the instruction at unrelated memory.
+      if (new_disp64 > INT32_MAX || new_disp64 < INT32_MIN) {
+        ERROR_LOG("[x86 relo] rip displacement out of range for insn at %p", buffer_cursor);
+        return -1;
+      }
+      int32_t new_disp = (int32_t)new_disp64;
 
       // keep orig insn opcode
       ___ EmitBuffer(buffer_cursor, insn.displacement_offset);
@@ -159,7 +173,11 @@ int GenRelocateSingleX86Insn(addr_t curr_orig_ip, addr_t curr_relo_ip, uint8_t *
       auto relo_next_ip = curr_relo_ip + x86_insn_encoded_len;
       codegen_x64_jmp_absolute_addr(&rip_insn_seq_buffer, relo_next_ip);
 
-      DobbyCodePatch((void *)rip_insn_seq_addr, rip_insn_seq_buffer.buffer, rip_insn_seq_buffer.buffer_size);
+      if (DobbyCodePatch((void *)rip_insn_seq_addr, rip_insn_seq_buffer.buffer,
+                         rip_insn_seq_buffer.buffer_size) != 0) {
+        ERROR_LOG("[x86 relo] could not write rip insn sequence at %p", (void *)rip_insn_seq_addr);
+        return -1;
+      }
     }
 
   } else if (relo_kind == X86_RELO_JMP_REL8) { // jmp rel8
@@ -213,9 +231,10 @@ int GenRelocateSingleX86Insn(addr_t curr_orig_ip, addr_t curr_relo_ip, uint8_t *
 #endif
   } else if (relo_kind == X86_RELO_UNSUPPORTED) {
     // LOOP/LOOPcc/JrCXZ: an IP-relative field with no rewrite here. Copying it verbatim would
-    // leave the trampoline branching into the original function, so this stays a hard stop.
-    // Callers that must not abort are expected to classify the target first and decline the hook.
-    UNIMPLEMENTED();
+    // leave the trampoline branching into the original function, so refuse the relocation and let
+    // the caller decline the hook. Aborting the process instead would take the guest with it.
+    ERROR_LOG("[x86 relo] unsupported ip-relative insn at %p", buffer_cursor);
+    return -1;
   } else {
     __ EmitBuffer(buffer_cursor, insn.length);
   }
@@ -226,7 +245,8 @@ int GenRelocateSingleX86Insn(addr_t curr_orig_ip, addr_t curr_relo_ip, uint8_t *
     int relo_len = relo_offset - last_relo_offset;
     DEBUG_LOG("insn -> relocated insn: %d -> %d", insn.length, relo_len);
   }
-  return relocated_insn_len;
+  (void)relocated_insn_len;
+  return 0;
 }
 
 void GenRelocateCodeX86Shared(void *buffer, CodeMemBlock *origin, CodeMemBlock *relocated, bool branch) {
@@ -242,6 +262,12 @@ x86_try_again:
   }
 
   int ret = GenRelocateCodeFixed(buffer, origin, relocated, branch);
+  if (ret == -2) {
+    // An instruction could not be relocated at all. Leaving the block empty is the signal callers
+    // check to refuse the hook.
+    relocated->reset(0, 0);
+    return;
+  }
   if (ret != 0) {
     const int step_size = 16;
     expected_relocated_mem_size += step_size;

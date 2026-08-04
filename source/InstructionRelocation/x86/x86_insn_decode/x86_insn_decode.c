@@ -1,6 +1,8 @@
 #include "platform_detect_macro.h"
 #if defined(TARGET_ARCH_IA32) || defined(TARGET_ARCH_X64)
 
+#include <string.h>
+
 #include "x86_insn_decode.h"
 
 #include "logging/logging.h"
@@ -67,7 +69,7 @@
 
 /* Opcode extension in modrm byte reg field. */
 #define foreach_x86_insn_modrm_reg_group                                                                               \
-  _(1) _(1a) _(2) _(3) _(4) _(5) _(6) _(7) _(8) _(9) _(10) _(11) _(12) _(13) _(14) _(15) _(16) _(p)
+  _(1) _(1a) _(2) _(3) _(3b) _(4) _(5) _(6) _(7) _(8) _(9) _(10) _(11) _(12) _(13) _(14) _(15) _(16) _(p)
 #define foreach_x86_insn_sse_group                                                                                     \
   _(10) _(28) _(50) _(58) _(60) _(68) _(70) _(78) _(c0) _(d0) _(d8) _(e0) _(e8) _(f0) _(f8)
 enum {
@@ -77,12 +79,12 @@ enum {
   foreach_x86_insn_modrm_reg_group
 #undef _
 
-      X86_INSN_SSE_GROUP_START = 19,
+      X86_INSN_SSE_GROUP_START = 20,
 #define _(x) X86_INSN_SSE_GROUP_##x,
   foreach_x86_insn_sse_group
 #undef _
 
-      X86_INSN_GROUP_END = 35
+      X86_INSN_GROUP_END = 36
 };
 
 #define X86_INSN_GROUP_END_MASK ((1 << 6) - 1)
@@ -339,11 +341,17 @@ void x86_insn_decode_modrm_sib(x86_insn_reader_t *rd, x86_insn_decode_t *insn, x
 
       // for 64 bit
       if (effective_address_bits == 64) {
-        if (mem_op->mem.base == RBP || mem_op->mem.base == R13) {
+        // "No base register, 32-bit displacement" is selected by the 3-bit SIB.base field being
+        // 101b with mod == 00 -- REX.B does not participate. Testing the REX-extended register
+        // number against the x86_ia32e_register_t constants instead compared two different
+        // numbering schemes: a base of r14 (raw 14) collided with the R13 enumerator and gained a
+        // displacement it does not have, while a real base of 101b never matched and lost the
+        // disp32 it does have. Both shift every following instruction.
+        if (sib.base == 5) {
           if (mod == 0) {
             mem_op->mem.base = RNone;
-          }
-          if (mod == 1) {
+            disp_bits = 32;
+          } else if (mod == 1) {
             disp_bits = 8;
           } else {
             disp_bits = 32;
@@ -437,9 +445,25 @@ void x86_insn_decode_modrm_sib(x86_insn_reader_t *rd, x86_insn_decode_t *insn, x
 static void x86_insn_decode_opcode(x86_insn_reader_t *rd, x86_insn_decode_t *insn, x86_options_t *conf) {
   uint8_t opcode = read_byte(rd);
 
+  /* VEX (C5 two-byte, C4 three-byte) and EVEX (62) introduce an encoding this decoder does not
+     model at all -- in 64-bit mode those opcodes are never the legacy LES/LDS/BOUND. Their length
+     depends on payload bytes that are not read here, so any length reported would be a guess. */
+  if (conf->mode == 64 && (opcode == 0xC4 || opcode == 0xC5 || opcode == 0x62)) {
+    insn->flags |= X86_INSN_DECODE_FLAG_UNDECODABLE;
+    insn->primary_opcode = opcode;
+    return;
+  }
+
   x86_insn_spec_t insn_spec;
   if (opcode == 0x0f) {
     opcode = read_byte(rd);
+    /* 0F 38 and 0F 3A are three-byte opcode escapes; the byte after them selects the
+       instruction and is not consulted here. */
+    if (opcode == 0x38 || opcode == 0x3A) {
+      insn->flags |= X86_INSN_DECODE_FLAG_UNDECODABLE | X86_INSN_DECODE_FLAG_TWO_BYTE_OPCODE;
+      insn->primary_opcode = opcode;
+      return;
+    }
     insn_spec = x86_opcode_map_two_byte[opcode];
     // primary_opcode keeps only the second byte, so record the escape. Two-byte opcodes overlap
     // the one-byte space (0F 7E is an SSE move, 7E is a short conditional branch) and a consumer
@@ -451,9 +475,11 @@ static void x86_insn_decode_opcode(x86_insn_reader_t *rd, x86_insn_decode_t *ins
 
   // check sse group
   if (X86_INSN_FLAG_GET_GROUP(insn_spec.flags) > X86_INSN_SSE_GROUP_START) {
-    // An SSE opcode in the bytes being relocated used to abort the process. The base table entry
-    // already carries this instruction's operands, so keeping it decodes the length correctly;
-    // only the group refinement (which selects between prefix variants) is skipped.
+    // An SSE opcode in the bytes being relocated used to abort the process. It no longer does,
+    // but the group refinement that selects between the prefix variants -- and with it the
+    // operand form -- is skipped, so the length the base entry implies is not dependable. Report
+    // it as unmodelled and let the caller refuse the hook.
+    insn->flags |= X86_INSN_DECODE_FLAG_UNDECODABLE;
     insn->primary_opcode = opcode;
     insn->insn_spec = insn_spec;
     return;
@@ -482,11 +508,26 @@ static void x86_insn_decode_opcode(x86_insn_reader_t *rd, x86_insn_decode_t *ins
     // group's unconditionally erased the first kind; ignoring it left the second kind with no
     // operands to decode, which reported those instructions as one byte long and desynchronised
     // every instruction relocated after them. '_' is the table's placeholder for "not declared".
-    if (group_insn->operands[0].code != '_') {
+    // Append rather than replace: the two entries describe different halves of the encoding. The
+    // base entry carries the ModRM operand and its width (0xF7 is Ev, 0xF6 is Eb), while the group
+    // entry carries whatever the reg field adds -- an immediate for `test`, nothing for `neg`.
+    // Replacing dropped the ModRM operand, so `test $0xf,%rdx` decoded as two bytes; ignoring the
+    // group dropped the operands of 0xFF, whose base entry declares none.
+    for (int g = 0; g < 3; g++) {
+      if (group_insn->operands[g].code == '_')
+        continue;
       for (int i = 0; i < 3; i++) {
-        insn_spec.operands[i] = group_insn->operands[i];
+        if (insn_spec.operands[i].code == '_') {
+          insn_spec.operands[i] = group_insn->operands[g];
+          break;
+        }
       }
     }
+  }
+
+  /* An opcode the table has no entry for. Its operands are unknown, so the length is too. */
+  if (insn_spec.name != NULL && insn_spec.name[0] == 'b' && strcmp(insn_spec.name, "bad") == 0) {
+    insn->flags |= X86_INSN_DECODE_FLAG_UNDECODABLE;
   }
 
   insn->primary_opcode = opcode;
@@ -542,6 +583,15 @@ void x86_insn_decode_immediate(x86_insn_reader_t *rd, x86_insn_decode_t *insn, x
 
   int64_t immediate = 0;
   uint8_t imm_bits = x86_insn_imm_bits(&insn->insn_spec, effective_operand_bits);
+  // A moffs operand ('O', opcodes A0..A3) is an absolute address whose width follows the address
+  // size, not the 'b'/'v' data-size letter the table records. Sizing it from that letter made
+  // `movabs 0x...,%al` decode two bytes instead of ten in 64-bit mode.
+  for (int i = 0; i < 3; i++) {
+    if (insn->insn_spec.operands[i].code == 'O') {
+      imm_bits = (conf->mode == 64) ? 64 : (uint8_t)conf->mode;
+      break;
+    }
+  }
   if (imm_bits == 0)
     return;
 

@@ -38,8 +38,21 @@ static x86_insn_group8_t x86_insn_modrm_reg_groups[] = {
 
     [X86_INSN_MODRM_REG_GROUP_3].insns =
         {
-            op0(test),
-            op0(test),
+            op1(test, Iz),
+            op1(test, Iz),
+            op0(not ),
+            op0(neg),
+            op0(mul),
+            op0(imul),
+            op0(div),
+            op0(idiv),
+        },
+
+    /* 0xF6: the byte-operand form of group 3, whose immediate is a byte rather than Iz. */
+    [X86_INSN_MODRM_REG_GROUP_3b].insns =
+        {
+            op1(test, Ib),
+            op1(test, Ib),
             op0(not ),
             op0(neg),
             op0(mul),
